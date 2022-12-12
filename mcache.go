@@ -340,9 +340,5 @@ type selectedKey struct {
 // memUsageOnCache is a rough approximation of the memory used to store an
 // item.
 func memUsageOnCache(key string, val []byte) int64 {
-	keyMemUsage := 8 + len(key)
-	valMemUsage := 12 + len(val)
-	sliceOverhead := 8
-	size := int64(valMemUsage + keyMemUsage + sliceOverhead)
-	return size
+	return int64(len(key) + len(val) + 50)
 }
