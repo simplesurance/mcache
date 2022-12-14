@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -eu -o pipefail
+set -x
 
 dst="$(mktemp)"
 go test -c -o "$dst"

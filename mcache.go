@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
-	"os"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -96,7 +95,7 @@ func (c *Cache) Put(key string, value []byte, exp time.Time) {
 	}
 
 	writtenBytesColdCache := atomic.LoadInt64(&c.cold.byteWrittenSinceLastPromotion)
-	fmt.Fprintf(os.Stderr,
+	fmt.Fprintf(log,
 		"Put(k=%q) writtenOnColdCache=>%d size=%dB\n cold=>%v\n  hot=>%s\n",
 		key, writtenBytesColdCache, size, &c.cold, &c.hot)
 	c.promoteToHotMaybe(size)
@@ -109,7 +108,7 @@ func (c *Cache) Put(key string, value []byte, exp time.Time) {
 
 	c.hot.mu.RLock()
 	if _, exists := c.hot.items.GetByKey(key); exists {
-		fmt.Fprintln(os.Stderr, "ONHOT")
+		fmt.Fprintln(log, "ONHOT")
 		// item is already on the hot cache; lock it as rw to update in-place
 		c.hot.mu.RUnlock()
 		c.hot.mu.Lock()
@@ -181,10 +180,10 @@ func (c *Cache) promoteToHotMaybe(size int64) {
 		return
 	}
 
-	fmt.Fprintln(os.Stderr, "\nPROMOTION")
+	fmt.Fprintln(log, "\nPROMOTION")
 	defer func() {
 		atomic.AddInt64(&c.cold.byteWrittenSinceLastPromotion, -written)
-		fmt.Fprintln(os.Stderr)
+		fmt.Fprintln(log)
 	}()
 
 	c.cold.mu.Lock()
@@ -193,14 +192,14 @@ func (c *Cache) promoteToHotMaybe(size int64) {
 	hotb4 := c.hot.String()
 	coldb4 := c.cold.String()
 	defer func() {
-		fmt.Fprintf(os.Stderr, "cold\n  -%s\n  +%s\n", coldb4, c.cold.String())
-		fmt.Fprintf(os.Stderr, "hot\n  -%s\n  +%s\n", hotb4, c.hot.String())
+		fmt.Fprintf(log, "cold\n  -%s\n  +%s\n", coldb4, c.cold.String())
+		fmt.Fprintf(log, "hot\n  -%s\n  +%s\n", hotb4, c.hot.String())
 	}()
 
 	// select items accounting for 1/4 the memory usage of the cold cache with
 	// highest usefulness
 	sCold := sortedKeys(&c.cold)
-	fmt.Fprintf(os.Stderr, "sorted cold: %v\n", sCold)
+	fmt.Fprintf(log, "sorted cold: %v\n", sCold)
 	var cut int
 	var bytesToPromote int64
 	for cut = len(sCold); bytesToPromote < c.cold.maxSize/2; cut-- {
@@ -338,7 +337,7 @@ func (c *Cache) reorganize() {
 
 func limitMemoryUsage(area *cacheArea, maxMem int64, spilover map[string]*item) bool {
 	defer func() {
-		fmt.Fprintf(os.Stderr,
+		fmt.Fprintf(log,
 			"limitMemoryUsage: memUsage: %d, max=%d area=>%s spil=%v\n",
 			area.memoryUsage, maxMem, area, spilover)
 	}()
@@ -362,7 +361,7 @@ func limitMemoryUsage(area *cacheArea, maxMem int64, spilover map[string]*item) 
 				spilover[rndKey], _ = area.items.GetByKey(rndKey)
 			}
 
-			fmt.Fprintf(os.Stderr, "limitMemoryUsage(maxMem=%d) fast released %v\n", maxMem, rndKey)
+			fmt.Fprintf(log, "limitMemoryUsage(maxMem=%d) fast released %v\n", maxMem, rndKey)
 			remove(area, rndKey)
 
 			if area.memoryUsage <= maxMem {

@@ -64,7 +64,7 @@ func TestReplace(t *testing.T) {
 }
 
 func TestPutGetPerformance(t *testing.T) {
-	const wantWrites = 100000
+	const wantWrites = 1000
 	const maxTime = 5 * time.Second
 
 	f, err := os.Create("pprof.pb.gz")
