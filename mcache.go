@@ -1,8 +1,11 @@
 package mcache
 
 import (
+	"encoding/hex"
 	"fmt"
+	"io"
 	"math/rand"
+	"os"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -10,6 +13,8 @@ import (
 
 	"github.com/simplesurance/mcache/rndmap"
 )
+
+var log = io.Discard
 
 // New creates a new cache instance with the give memory limit.
 func New(memLim int64, opt ...Option) *Cache {
@@ -24,7 +29,7 @@ func New(memLim int64, opt ...Option) *Cache {
 			maxSize:     memLim / 2,
 			items:       rndmap.IndexableMap[string, *item]{},
 			mu:          &sync.RWMutex{},
-			fastAndDump: true,
+			fastAndDumb: true,
 		},
 	}
 
@@ -46,7 +51,6 @@ type Cache struct {
 
 // Get retrieves a cached item, if an unexpired one can be found.
 func (c *Cache) Get(key string) ([]byte, bool) {
-	// the order "hot", then "cold" must be followed to avoid deadlocks
 	now := time.Now()
 	i := 0
 	for _, area := range []*cacheArea{&c.hot, &c.cold} {
@@ -74,18 +78,28 @@ func (c *Cache) Get(key string) ([]byte, bool) {
 	return nil, false
 }
 
-// Put stores one item on cache.
+// Put stores one item in cache.
 func (c *Cache) Put(key string, value []byte, exp time.Time) {
 	atomic.AddInt64(&c.stats.writes, 1)
 
 	size := memUsageOnCache(key, value)
-	if size > c.cold.maxSize/2 {
-		// At least a few items of this size must fit on a cache are, or
-		// else the promotion to the "hot" area won't be possible. Picking
-		// a size limit that would allow at least 2 items to fit on a cache
-		// area.
+	if size > c.cold.maxSize {
+		c.hot.mu.Lock()
+		defer c.hot.mu.Unlock()
+		remove(&c.hot, key)
+
+		c.cold.mu.Lock()
+		defer c.cold.mu.Unlock()
+		remove(&c.cold, key)
+
 		return
 	}
+
+	writtenBytesColdCache := atomic.LoadInt64(&c.cold.byteWrittenSinceLastPromotion)
+	fmt.Fprintf(os.Stderr,
+		"Put(k=%q) writtenOnColdCache=>%d size=%dB\n cold=>%v\n  hot=>%s\n",
+		key, writtenBytesColdCache, size, &c.cold, &c.hot)
+	c.promoteToHotMaybe(size)
 
 	it := item{
 		value:      value,
@@ -93,12 +107,10 @@ func (c *Cache) Put(key string, value []byte, exp time.Time) {
 		expiration: exp,
 	}
 
-	// The item might already be present in the hot cache. For that it is
-	// necessary to promote the lock from ro to rw, then recompute the
-	// change in memory. If the new item is bigger then the old one, there
-	// might be a spillover from the hot cache to the cold one.
 	c.hot.mu.RLock()
 	if _, exists := c.hot.items.GetByKey(key); exists {
+		fmt.Fprintln(os.Stderr, "ONHOT")
+		// item is already on the hot cache; lock it as rw to update in-place
 		c.hot.mu.RUnlock()
 		c.hot.mu.Lock()
 		defer c.hot.mu.Unlock()
@@ -150,6 +162,84 @@ func (c *Cache) Statistics() Statistics {
 	}
 }
 
+func (c *Cache) needsPromotionToFit(size int64) (int64, bool) {
+	writtenToCold := atomic.LoadInt64(&c.cold.byteWrittenSinceLastPromotion) + size
+	return writtenToCold, writtenToCold > c.cold.maxSize/2
+}
+
+func (c *Cache) promoteToHotMaybe(size int64) {
+	if _, needs := c.needsPromotionToFit(size); !needs {
+		return
+	}
+
+	c.hot.mu.Lock()
+	defer c.hot.mu.Unlock()
+
+	// need to repeat the test inside the critical section
+	written, needs := c.needsPromotionToFit(size)
+	if !needs {
+		return
+	}
+
+	fmt.Fprintln(os.Stderr, "\nPROMOTION")
+	defer func() {
+		atomic.AddInt64(&c.cold.byteWrittenSinceLastPromotion, -written)
+		fmt.Fprintln(os.Stderr)
+	}()
+
+	c.cold.mu.Lock()
+	defer c.cold.mu.Unlock()
+
+	hotb4 := c.hot.String()
+	coldb4 := c.cold.String()
+	defer func() {
+		fmt.Fprintf(os.Stderr, "cold\n  -%s\n  +%s\n", coldb4, c.cold.String())
+		fmt.Fprintf(os.Stderr, "hot\n  -%s\n  +%s\n", hotb4, c.hot.String())
+	}()
+
+	// select items accounting for 1/4 the memory usage of the cold cache with
+	// highest usefulness
+	sCold := sortedKeys(&c.cold)
+	fmt.Fprintf(os.Stderr, "sorted cold: %v\n", sCold)
+	var cut int
+	var bytesToPromote int64
+	for cut = len(sCold); bytesToPromote < c.cold.maxSize/2; cut-- {
+		itInfo := sCold[cut-1]
+		item, _ := c.cold.items.GetByKey(itInfo.key)
+		bytesToPromote += memUsageOnCache(itInfo.key, item.value)
+	}
+	if cut >= len(sCold) {
+		return
+	}
+
+	toPromote := sCold[cut:]
+	notPromoted := sCold[:cut]
+
+	// make up space on the hot cache
+	spilover := map[string]*item{}
+	limitMemoryUsage(&c.hot, bytesToPromote, spilover)
+
+	// move items from the cold cache to the hot cache
+	for _, itInfo := range toPromote {
+		it, _ := c.cold.items.GetByKey(itInfo.key)
+		put(&c.hot, itInfo.key, it, nil)
+		remove(&c.cold, itInfo.key)
+	}
+
+	// store items that spillover from hot cache into the cold cache by
+	// evicting items that where not promoted
+	for key, it := range spilover {
+		// make space for an item
+		for c.cold.maxSize-c.cold.memoryUsage < memUsageOnCache(key, it.value) {
+			remove(&c.cold, notPromoted[0].key)
+			notPromoted = notPromoted[1:]
+		}
+
+		// store it
+		put(&c.cold, key, it, nil)
+	}
+}
+
 // Statistics hods statistic data about the cache.
 type Statistics struct {
 	Writes      int64
@@ -169,11 +259,18 @@ func (s Statistics) String() string {
 }
 
 type cacheArea struct {
-	mu          *sync.RWMutex
-	items       rndmap.IndexableMap[string, *item]
-	memoryUsage int64
-	maxSize     int64
-	fastAndDump bool // cache eviction is O(1), but very dump
+	mu                            *sync.RWMutex
+	items                         rndmap.IndexableMap[string, *item]
+	memoryUsage                   int64
+	maxSize                       int64
+	fastAndDumb                   bool  // cache eviction is O(1), but very dump
+	byteWrittenSinceLastPromotion int64 // atomic
+}
+
+// FIXME remove
+func (c *cacheArea) String() string {
+	return fmt.Sprintf("mem=%d/%d dumb=%t written=%dB items=%v",
+		c.memoryUsage, c.maxSize, c.fastAndDumb, c.byteWrittenSinceLastPromotion, &c.items)
 }
 
 type item struct {
@@ -181,6 +278,11 @@ type item struct {
 	stored      time.Time
 	accessCount int64
 	expiration  time.Time
+}
+
+// FIXME remove
+func (i *item) String() string {
+	return fmt.Sprintf("0x%s", hex.EncodeToString(i.value))
 }
 
 func (it *item) usefullness(key string) float64 {
@@ -198,6 +300,7 @@ func put(area *cacheArea, key string, it *item, spilover map[string]*item) {
 	remove(area, key)
 
 	size := memUsageOnCache(key, it.value)
+	atomic.AddInt64(&area.byteWrittenSinceLastPromotion, size)
 
 	// New items go to the cold cache to avoid trashing the hot cache.
 	// Make space for the new item on the cold cache.
@@ -234,10 +337,11 @@ func (c *Cache) reorganize() {
 }
 
 func limitMemoryUsage(area *cacheArea, maxMem int64, spilover map[string]*item) bool {
-	if maxMem < 0 {
-		return false // impossible to accomplish
-	}
-
+	defer func() {
+		fmt.Fprintf(os.Stderr,
+			"limitMemoryUsage: memUsage: %d, max=%d area=>%s spil=%v\n",
+			area.memoryUsage, maxMem, area, spilover)
+	}()
 	if area.memoryUsage <= maxMem {
 		return true // there is already enough space
 	}
@@ -247,11 +351,20 @@ func limitMemoryUsage(area *cacheArea, maxMem int64, spilover map[string]*item) 
 		return true // there is already enough space
 	}
 
-	if area.fastAndDump {
+	// the cache area may allow a "fast and dump" method that allow removing
+	// items in O(1) time and space up to a limit
+	if area.fastAndDumb {
 		for {
 			rndix := rand.Intn(area.items.Size())
-			key, _ := area.items.GetByIndex(rndix)
-			remove(area, key)
+			rndKey, _ := area.items.GetByIndex(rndix)
+
+			if spilover != nil {
+				spilover[rndKey], _ = area.items.GetByKey(rndKey)
+			}
+
+			fmt.Fprintf(os.Stderr, "limitMemoryUsage(maxMem=%d) fast released %v\n", maxMem, rndKey)
+			remove(area, rndKey)
+
 			if area.memoryUsage <= maxMem {
 				return true // there is already enough space
 			}
@@ -319,26 +432,32 @@ func sortedKeys(area *cacheArea) []selectedKey {
 		}
 
 		ret[ix] = selectedKey{
-			usefullness: it.usefullness(key),
-			key:         key,
+			usefulness: it.usefullness(key),
+			key:        key,
 		}
 		ix++
 	}
 
 	sort.Slice(ret, func(i, j int) bool {
-		return ret[i].usefullness < ret[j].usefullness
+		return ret[i].usefulness < ret[j].usefulness
 	})
 
 	return ret
 }
 
 type selectedKey struct {
-	key         string
-	usefullness float64
+	key        string
+	usefulness float64
+}
+
+// FIXME remove
+func (s selectedKey) String() string {
+	return fmt.Sprintf("%q=%f", s.key, s.usefulness)
 }
 
 // memUsageOnCache is a rough approximation of the memory used to store an
 // item.
 func memUsageOnCache(key string, val []byte) int64 {
-	return int64(len(key) + len(val) + 50)
+	//return int64(len(key) + len(val) + 50)
+	return 1
 }

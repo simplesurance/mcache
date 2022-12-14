@@ -2,6 +2,7 @@ package rndmap
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 )
 
@@ -132,4 +133,19 @@ func (r *IndexableMap[TK, TV]) indexMustBeValid(index int) {
 			"index %d is outside the valid range [0;%d)",
 			index, len(r.keys)))
 	}
+}
+
+func (r *IndexableMap[TK, TV]) String() string {
+	iterator := r.Items()
+	ret := strings.Builder{}
+	for {
+		key, val, ok := iterator()
+		if !ok {
+			break
+		}
+
+		ret.WriteString(fmt.Sprintf("%v:%v ", key, val))
+	}
+
+	return "[" + ret.String() + "]"
 }
