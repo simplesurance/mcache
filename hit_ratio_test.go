@@ -12,7 +12,7 @@ import (
 // replacing items on the cache, what could cause LRU cache to have a hit ratio
 // equals to 0, becoming useless. This test asserts that this will not happen.
 func TestTrashingResistance(t *testing.T) {
-	const maxItemsOnCache = 32
+	const maxItemsOnCache = 1000
 	data := make([]byte, 0)
 	exp := time.Now().Add(time.Hour)
 	rand.Seed(time.Now().UnixNano())
@@ -26,14 +26,14 @@ func TestTrashingResistance(t *testing.T) {
 		c.Put(key, data, exp)
 	}
 
-	t.Logf("After preload:\n cold=%v\n hot=%v", &c.cold, &c.hot)
+	//t.Logf("After preload:\n cold=%v\n hot=%v", &c.cold, &c.hot)
 
 	// simulating a pattern where an item is searched on cache, and if it is
 	// not found, the cache gets populated. But there are 10 times more items
 	// then the cache can hold.
 	hits := 0
-	for cycle := 0; cycle < 10; cycle++ {
-		for i := 0; i < 10*maxItemsOnCache; i++ { // FIXME change to 10*
+	for cycle := 0; cycle < 5; cycle++ {
+		for i := 0; i < 5*maxItemsOnCache; i++ { // FIXME change to 10*
 			key := fmt.Sprintf("%06d", i)
 			_, hit := c.Get(key)
 			if hit {

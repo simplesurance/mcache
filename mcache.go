@@ -95,7 +95,7 @@ func (c *Cache) Put(key string, value []byte, exp time.Time) {
 		return
 	}
 
-	c.promoteToHotMaybe(size)
+	c.promoteToHotIfNeeded(size)
 
 	it := item{
 		value:      value,
@@ -113,7 +113,7 @@ func (c *Cache) Put(key string, value []byte, exp time.Time) {
 		// FIXME: check again if key was added it was unlocked
 
 		spilover := map[string]*item{}
-		put(&c.hot, key, &it, spilover)
+		put(&c.hot, key, &it, spilover, true)
 
 		if len(spilover) == 0 {
 			return
@@ -123,7 +123,7 @@ func (c *Cache) Put(key string, value []byte, exp time.Time) {
 		defer c.cold.mu.Unlock()
 
 		for key, it := range spilover {
-			put(&c.cold, key, it, nil)
+			put(&c.cold, key, it, nil, true)
 		}
 
 		return
@@ -136,7 +136,7 @@ func (c *Cache) Put(key string, value []byte, exp time.Time) {
 
 	// new items always go to the cold cache, to avoid trashing the hot
 	// area.
-	put(&c.cold, key, &it, nil)
+	put(&c.cold, key, &it, nil, true)
 }
 
 // Statistics loads statistics about the cache.
@@ -158,11 +158,16 @@ func (c *Cache) Statistics() Statistics {
 }
 
 func (c *Cache) needsPromotionToFit(size int64) (int64, bool) {
-	writtenToCold := atomic.LoadInt64(&c.cold.byteWrittenSinceLastPromotion) + size
-	return writtenToCold, writtenToCold > c.cold.maxSize/2
+	writtenSinceLastPromotion := atomic.LoadInt64(&c.cold.byteWrittenSinceLastPromotion) // + size
+	return writtenSinceLastPromotion, writtenSinceLastPromotion > c.cold.maxSize/2
 }
 
-func (c *Cache) promoteToHotMaybe(size int64) {
+func (c *Cache) promoteToHotIfNeeded(size int64) {
+	//fmt.Fprintf(os.Stderr,
+	//	"\npromoteToHotMaybe() cold=%d hot=%d coldSoFar=%d\n",
+	//	c.cold.items.Size(), c.hot.items.Size(),
+	//	atomic.LoadInt64(&c.cold.byteWrittenSinceLastPromotion))
+
 	if _, needs := c.needsPromotionToFit(size); !needs {
 		return
 	}
@@ -177,9 +182,7 @@ func (c *Cache) promoteToHotMaybe(size int64) {
 		return
 	}
 
-	defer func() {
-		atomic.AddInt64(&c.cold.byteWrittenSinceLastPromotion, -written)
-	}()
+	atomic.AddInt64(&c.cold.byteWrittenSinceLastPromotion, -written)
 
 	c.cold.mu.Lock()
 	defer c.cold.mu.Unlock()
@@ -193,13 +196,18 @@ func (c *Cache) promoteToHotMaybe(size int64) {
 		item, _ := c.cold.items.GetByKey(itInfo.key)
 		itSize := memUsageOnCache(itInfo.key, item.value)
 
-		if bytesToPromote+itSize > c.cold.maxSize/3 {
+		if bytesToPromote+itSize > c.cold.maxSize/2 {
 			break
 		}
 
 		bytesToPromote += itSize
 	}
 
+	//fmt.Fprintf(os.Stderr, "promoting %d/%d (%f%%) with cut=%d/%d\n",
+	//	bytesToPromote, c.cold.maxSize,
+	//	100.*float64(bytesToPromote)/float64(c.cold.maxSize),
+	//	cut, len(sortedCold),
+	//)
 	toPromote := sortedCold[cut:]
 	notPromoted := sortedCold[:cut]
 
@@ -210,7 +218,7 @@ func (c *Cache) promoteToHotMaybe(size int64) {
 	// move items from the cold cache to the hot cache
 	for _, itInfo := range toPromote {
 		it, _ := c.cold.items.GetByKey(itInfo.key)
-		put(&c.hot, itInfo.key, it, nil)
+		put(&c.hot, itInfo.key, it, nil, true)
 		remove(&c.cold, itInfo.key)
 	}
 
@@ -224,8 +232,13 @@ func (c *Cache) promoteToHotMaybe(size int64) {
 		}
 
 		// store it
-		put(&c.cold, key, it, nil)
+		put(&c.cold, key, it, nil, false)
 	}
+
+	//fmt.Fprintf(os.Stderr,
+	//	"promotion result: cold=%d hot=%d written=%d coldSoFar=%d\n",
+	//	c.cold.items.Size(), c.hot.items.Size(), written,
+	//	atomic.LoadInt64(&c.cold.byteWrittenSinceLastPromotion))
 }
 
 // Statistics hods statistic data about the cache.
@@ -269,12 +282,12 @@ type item struct {
 }
 
 // FIXME remove
-func (i *item) String() string {
-	return fmt.Sprintf("0x%s", hex.EncodeToString(i.value))
+func (it *item) String() string {
+	return fmt.Sprintf("0x%s", hex.EncodeToString(it.value))
 }
 
-func (it *item) usefullness(key string) float64 {
-	if it.expiration.Before(time.Now()) {
+func (it *item) usefullness(key string, now time.Time) float64 {
+	if it.expiration.Before(now) {
 		return 0
 	}
 
@@ -284,23 +297,25 @@ func (it *item) usefullness(key string) float64 {
 	return accesses / (age * size)
 }
 
-func put(area *cacheArea, key string, it *item, spilover map[string]*item) {
+func put(area *cacheArea, key string, it *item, spilover map[string]*item, mustAccount bool) {
 	remove(area, key)
 
 	size := memUsageOnCache(key, it.value)
-	atomic.AddInt64(&area.byteWrittenSinceLastPromotion, size)
 
 	// New items go to the cold cache to avoid trashing the hot cache.
 	// Make space for the new item on the cold cache.
 	limitMemoryUsage(area, area.maxSize-size, spilover)
 	if area.maxSize-area.memoryUsage < size {
 		// it doesn't fit
-		return
+		panic("FIXME REMOVE")
+		//return
 	}
 
+	if mustAccount { // FIXME this is uggly! make it go away!
+		atomic.AddInt64(&area.byteWrittenSinceLastPromotion, size)
+	}
 	area.memoryUsage += size
 	area.items.Put(key, it)
-
 }
 
 // keep items that have the highest value of:
@@ -405,6 +420,7 @@ func remove(area *cacheArea, key string) bool {
 
 func sortedKeys(area *cacheArea) []selectedKey {
 	ret := make([]selectedKey, area.items.Size())
+	now := time.Now()
 
 	var ix = 0
 	items := area.items.Items()
@@ -415,7 +431,7 @@ func sortedKeys(area *cacheArea) []selectedKey {
 		}
 
 		ret[ix] = selectedKey{
-			usefulness: it.usefullness(key),
+			usefulness: it.usefullness(key, now),
 			key:        key,
 		}
 		ix++
