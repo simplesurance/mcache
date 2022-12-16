@@ -3,7 +3,6 @@ package mcache
 import (
 	"encoding/hex"
 	"fmt"
-	"io"
 	"math/rand"
 	"sort"
 	"sync"
@@ -12,8 +11,6 @@ import (
 
 	"github.com/simplesurance/mcache/rndmap"
 )
-
-var log = io.Discard
 
 // New creates a new cache instance with the give memory limit.
 func New(memLim int64, opt ...Option) *Cache {
@@ -83,9 +80,13 @@ func (c *Cache) Put(key string, value []byte, exp time.Time) {
 
 	size := memUsageOnCache(key, value)
 	if size > c.cold.maxSize {
+		// if the item is too big it won't be cached, and if there is already
+		// a version on the cache, that item must be removed
 		c.hot.mu.Lock()
 		defer c.hot.mu.Unlock()
-		remove(&c.hot, key)
+		if remove(&c.hot, key) {
+			return
+		}
 
 		c.cold.mu.Lock()
 		defer c.cold.mu.Unlock()
@@ -94,10 +95,6 @@ func (c *Cache) Put(key string, value []byte, exp time.Time) {
 		return
 	}
 
-	writtenBytesColdCache := atomic.LoadInt64(&c.cold.byteWrittenSinceLastPromotion)
-	fmt.Fprintf(log,
-		"Put(k=%q) writtenOnColdCache=>%d size=%dB\n cold=>%v\n  hot=>%s\n",
-		key, writtenBytesColdCache, size, &c.cold, &c.hot)
 	c.promoteToHotMaybe(size)
 
 	it := item{
@@ -108,7 +105,6 @@ func (c *Cache) Put(key string, value []byte, exp time.Time) {
 
 	c.hot.mu.RLock()
 	if _, exists := c.hot.items.GetByKey(key); exists {
-		fmt.Fprintln(log, "ONHOT")
 		// item is already on the hot cache; lock it as rw to update in-place
 		c.hot.mu.RUnlock()
 		c.hot.mu.Lock()
@@ -174,45 +170,38 @@ func (c *Cache) promoteToHotMaybe(size int64) {
 	c.hot.mu.Lock()
 	defer c.hot.mu.Unlock()
 
-	// need to repeat the test inside the critical section
+	// need to repeat the test inside the critical section because the first
+	// test allows parallel execution
 	written, needs := c.needsPromotionToFit(size)
 	if !needs {
 		return
 	}
 
-	fmt.Fprintln(log, "\nPROMOTION")
 	defer func() {
 		atomic.AddInt64(&c.cold.byteWrittenSinceLastPromotion, -written)
-		fmt.Fprintln(log)
 	}()
 
 	c.cold.mu.Lock()
 	defer c.cold.mu.Unlock()
 
-	hotb4 := c.hot.String()
-	coldb4 := c.cold.String()
-	defer func() {
-		fmt.Fprintf(log, "cold\n  -%s\n  +%s\n", coldb4, c.cold.String())
-		fmt.Fprintf(log, "hot\n  -%s\n  +%s\n", hotb4, c.hot.String())
-	}()
+	sortedCold := sortedKeys(&c.cold)
 
-	// select items accounting for 1/4 the memory usage of the cold cache with
-	// highest usefulness
-	sCold := sortedKeys(&c.cold)
-	fmt.Fprintf(log, "sorted cold: %v\n", sCold)
 	var cut int
 	var bytesToPromote int64
-	for cut = len(sCold); bytesToPromote < c.cold.maxSize/2; cut-- {
-		itInfo := sCold[cut-1]
+	for cut = len(sortedCold); cut > 0; cut-- {
+		itInfo := sortedCold[cut-1]
 		item, _ := c.cold.items.GetByKey(itInfo.key)
-		bytesToPromote += memUsageOnCache(itInfo.key, item.value)
-	}
-	if cut >= len(sCold) {
-		return
+		itSize := memUsageOnCache(itInfo.key, item.value)
+
+		if bytesToPromote+itSize > c.cold.maxSize/3 {
+			break
+		}
+
+		bytesToPromote += itSize
 	}
 
-	toPromote := sCold[cut:]
-	notPromoted := sCold[:cut]
+	toPromote := sortedCold[cut:]
+	notPromoted := sortedCold[:cut]
 
 	// make up space on the hot cache
 	spilover := map[string]*item{}
@@ -336,11 +325,6 @@ func (c *Cache) reorganize() {
 }
 
 func limitMemoryUsage(area *cacheArea, maxMem int64, spilover map[string]*item) bool {
-	defer func() {
-		fmt.Fprintf(log,
-			"limitMemoryUsage: memUsage: %d, max=%d area=>%s spil=%v\n",
-			area.memoryUsage, maxMem, area, spilover)
-	}()
 	if area.memoryUsage <= maxMem {
 		return true // there is already enough space
 	}
@@ -351,7 +335,7 @@ func limitMemoryUsage(area *cacheArea, maxMem int64, spilover map[string]*item) 
 	}
 
 	// the cache area may allow a "fast and dump" method that allow removing
-	// items in O(1) time and space up to a limit
+	// each item in O(1) on time and space
 	if area.fastAndDumb {
 		for {
 			rndix := rand.Intn(area.items.Size())
@@ -361,7 +345,6 @@ func limitMemoryUsage(area *cacheArea, maxMem int64, spilover map[string]*item) 
 				spilover[rndKey], _ = area.items.GetByKey(rndKey)
 			}
 
-			fmt.Fprintf(log, "limitMemoryUsage(maxMem=%d) fast released %v\n", maxMem, rndKey)
 			remove(area, rndKey)
 
 			if area.memoryUsage <= maxMem {
@@ -409,14 +392,15 @@ func cleanExpired(area *cacheArea) {
 // removes removes the item from the cache, update memory consumption and
 // return old item.
 // - area must be RW-locked
-func remove(area *cacheArea, key string) {
+func remove(area *cacheArea, key string) bool {
 	it, ok := area.items.GetByKey(key)
 	if !ok {
-		return
+		return false
 	}
 
 	area.memoryUsage -= memUsageOnCache(key, it.value)
 	area.items.DeleteByKey(key)
+	return true
 }
 
 func sortedKeys(area *cacheArea) []selectedKey {
@@ -457,6 +441,5 @@ func (s selectedKey) String() string {
 // memUsageOnCache is a rough approximation of the memory used to store an
 // item.
 func memUsageOnCache(key string, val []byte) int64 {
-	//return int64(len(key) + len(val) + 50)
-	return 1
+	return int64(len(key) + len(val) + 50)
 }

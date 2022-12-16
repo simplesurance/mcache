@@ -40,15 +40,19 @@ func TestReplace(t *testing.T) {
 	data2 := []byte("test data with different length")
 
 	c.Put("abc", data1, time.Now().Add(10*time.Second))
-	wantStats := c.Statistics()
+	read, ok := c.Get("abc")
+	if !ok || !slices.Equal(read, data1) {
+		t.Fatal("data not restored to the original value after writing the original value")
+	}
 
 	// change the value
+	wantStats := c.Statistics()
 	c.Put("abc", data2, time.Now().Add(10*time.Second))
 	changedStats := c.Statistics()
 	if changedStats.MemoryUsage == wantStats.MemoryUsage {
 		t.Fatalf("memory usage not changed after writing item with different size: %v", changedStats)
 	}
-	read, ok := c.Get("abc")
+	read, ok = c.Get("abc")
 	if !ok || !slices.Equal(read, data2) {
 		t.Fatal("data not restored to the original value after writing the original value")
 	}
@@ -64,7 +68,7 @@ func TestReplace(t *testing.T) {
 }
 
 func TestPutGetPerformance(t *testing.T) {
-	const wantWrites = 1000
+	const wantWrites = 200000
 	const maxTime = 5 * time.Second
 
 	f, err := os.Create("pprof.pb.gz")
