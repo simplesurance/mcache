@@ -68,8 +68,8 @@ func TestReplace(t *testing.T) {
 }
 
 func TestPutGetPerformance(t *testing.T) {
-	const wantWrites = 200000
-	const maxTime = 5 * time.Second
+	const wantWrites = 1000000
+	const maxTime = 30 * time.Second
 
 	f, err := os.Create("pprof.pb.gz")
 	if err != nil {
@@ -94,7 +94,9 @@ func TestPutGetPerformance(t *testing.T) {
 	pprof.StartCPUProfile(f)
 	for i = 0; i < wantWrites; i++ {
 		c.Put(keys[i], data, exp)
-		c.Get("0")
+		if _, found := c.Get("0"); !found {
+			t.Fatalf("Get(0) haven't found an entry")
+		}
 	}
 	pprof.StopCPUProfile()
 
@@ -104,4 +106,5 @@ func TestPutGetPerformance(t *testing.T) {
 	}
 
 	t.Logf("%v", c.Statistics())
+	t.Logf("%f ops/s", float64(2*wantWrites)/time.Since(start).Seconds())
 }
